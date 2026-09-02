@@ -7,6 +7,10 @@
 import type { Browser } from '@browseros/browser-core/browser'
 import type { BrowserSession } from '@browseros/browser-core/core/session'
 import {
+  AcpAgentTargetSchema,
+  BrowserOsAgentTargetSchema,
+} from '@browseros/shared/schemas/agent'
+import {
   type BrowserContext,
   BrowserContextSchema,
 } from '@browseros/shared/schemas/browser-context'
@@ -14,7 +18,6 @@ import { LLMConfigSchema } from '@browseros/shared/schemas/llm'
 import { z } from 'zod'
 import type { ServerActivity } from './services/server-activity'
 
-// Re-export browser context types for consumers
 export type { BrowserContext }
 
 export const AgentLLMConfigSchema = LLMConfigSchema.extend({
@@ -22,7 +25,24 @@ export const AgentLLMConfigSchema = LLMConfigSchema.extend({
   upstreamProvider: z.string().optional(),
 })
 
-export const ChatRequestSchema = AgentLLMConfigSchema.extend({
+const PreviousConversationSchema = z
+  .union([
+    z.array(
+      z.object({
+        role: z.enum(['user', 'assistant']),
+        content: z.string(),
+      }),
+    ),
+    z.string(),
+  ])
+  .optional()
+  .transform((value) => {
+    if (typeof value !== 'string') return value
+    if (!value.trim()) return undefined
+    return [{ role: 'user' as const, content: value }]
+  })
+
+const ChatInputSchema = z.object({
   conversationId: z.string().uuid(),
   message: z.string().optional().default(''),
   contextWindowSize: z.number().optional(),
@@ -31,6 +51,7 @@ export const ChatRequestSchema = AgentLLMConfigSchema.extend({
   isScheduledTask: z.boolean().optional().default(false),
   userWorkingDir: z.string().min(1).optional(),
   supportsImages: z.boolean().optional().default(true),
+  supportsReasoning: z.boolean().optional().default(true),
   mode: z.enum(['chat', 'agent']).optional().default('agent'),
   origin: z.enum(['sidepanel', 'newtab']).optional().default('sidepanel'),
   declinedApps: z.array(z.string()).optional(),
@@ -41,39 +62,53 @@ export const ChatRequestSchema = AgentLLMConfigSchema.extend({
       title: z.string(),
     })
     .optional(),
-  previousConversation: z
-    .union([
-      z.array(
-        z.object({
-          role: z.enum(['user', 'assistant']),
-          content: z.string(),
-        }),
-      ),
-      z.string(),
-    ])
-    .optional()
-    .transform((val) => {
-      if (typeof val !== 'string') return val
-      if (!val.trim()) return undefined
-      return [{ role: 'user' as const, content: val }]
-    }),
+  previousConversation: PreviousConversationSchema,
+  // 'local': the server owns history in SQLite (load + persist). 'cloud': the
+  // client owns history (logged-in cloud sync or incognito); the server stays
+  // stateless and persists nothing. Defaults to 'cloud' so existing clients are
+  // unchanged until they opt into server-owned history.
+  historyMode: z.enum(['local', 'cloud']).optional().default('cloud'),
+  attachments: z
+    .array(
+      z.object({
+        mediaType: z.string().min(1),
+        data: z.string().min(1),
+      }),
+    )
+    .optional(),
 })
 
+const BrowserOsChatRequestSchema = AgentLLMConfigSchema.merge(ChatInputSchema)
+  .extend({
+    target: BrowserOsAgentTargetSchema.optional(),
+  })
+  .transform((request) => ({
+    ...request,
+    target: request.target ?? {
+      type: 'browseros' as const,
+      providerId: request.providerId || request.provider,
+    },
+  }))
+
+const AcpChatRequestSchema = ChatInputSchema.extend({
+  target: AcpAgentTargetSchema,
+})
+
+export const ChatRequestSchema = z.union([
+  AcpChatRequestSchema,
+  BrowserOsChatRequestSchema,
+])
+
+export type AcpChatRequest = z.infer<typeof AcpChatRequestSchema>
+export type BrowserOsChatRequest = z.infer<typeof BrowserOsChatRequestSchema>
 export type ChatRequest = z.infer<typeof ChatRequestSchema>
 
-/**
- * Hono environment bindings for Bun.serve integration.
- */
 export type Env = {
   Bindings: {
     server: ReturnType<typeof Bun.serve>
   }
 }
 
-/**
- * Configuration for the consolidated HTTP server.
- * This server handles all routes: health, klavis, chat, mcp, provider
- */
 export interface HttpServerConfig {
   port: number
   host?: string

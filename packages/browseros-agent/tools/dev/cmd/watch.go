@@ -41,7 +41,7 @@ const (
 func init() {
 	watchCmd.Flags().BoolVar(&watchNew, "new", false, "Use random available ports in 9000-9999 and create a fresh user-data directory")
 	watchCmd.Flags().BoolVar(&watchManual, "manual", false, "Build agent statically instead of WXT HMR mode")
-	watchCmd.Flags().BoolVar(&watchClaw, "claw", false, "Run the BrowserClaw UI and standalone server")
+	watchCmd.Flags().BoolVar(&watchClaw, "claw", false, "Run the BrowserOS neo UI and standalone server")
 	rootCmd.AddCommand(watchCmd)
 }
 
@@ -210,7 +210,7 @@ func watchMode() (string, error) {
 		return "", fmt.Errorf("--manual cannot be combined with --claw")
 	}
 	if watchClaw {
-		return "BrowserClaw", nil
+		return "BrowserOS neo", nil
 	}
 	if watchManual {
 		return "BrowserOS manual", nil
@@ -258,7 +258,7 @@ func watchProduct(claw bool) string {
 	return browser.ProductBrowserOS
 }
 
-// buildClawWatchEnv bridges shared dev ports into the standalone BrowserClaw apps.
+// buildClawWatchEnv bridges shared dev ports into the standalone BrowserOS neo apps.
 func buildClawWatchEnv(env []string, p proc.Ports) []string {
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d", p.Server)
 	return append(env,
@@ -269,7 +269,7 @@ func buildClawWatchEnv(env []string, p proc.Ports) []string {
 
 func logClawBrowserBinary(resolution browser.BinaryResolution) {
 	if resolution.Fallback {
-		proc.LogMsgf(proc.TagInfo, "BrowserClaw app not found at %s; using %s", browser.BrowserClawBinaryPath, resolution.Path)
+		proc.LogMsgf(proc.TagInfo, "BrowserOS neo app not found at %s; using %s", browser.BrowserClawBinaryPath, resolution.Path)
 		return
 	}
 	proc.LogMsgf(proc.TagInfo, "Browser app: %s", resolution.Path)
@@ -309,6 +309,21 @@ func startBrowserOSWatch(ctx context.Context, wg *sync.WaitGroup, root string, e
 			Env:     env,
 			Restart: true,
 			Cmd:     []string{"bun", "--env-file=../../.env.development", "wxt"},
+		}))
+
+		// Plain-URL preview of the extension pages. Static-serves the
+		// `dist/chrome-mv3-dev` directory that `wxt` writes to, so
+		// agent-browser (or any regular browser) can open the app pages
+		// via http://127.0.0.1:5175/app.html (for example the onboarding
+		// flow at /app.html#/onboarding) without installing the extension.
+		// The served HTML references wxt's Vite dev server for its module
+		// and HMR client URLs, so live-reload still works on this URL.
+		procs = append(procs, proc.StartManaged(ctx, wg, proc.ProcConfig{
+			Tag:     proc.TagWeb,
+			Dir:     agentDir,
+			Env:     env,
+			Restart: true,
+			Cmd:     []string{"bun", "run", "dev:web"},
 		}))
 	}
 

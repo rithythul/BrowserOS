@@ -14,9 +14,6 @@ export type ProviderType =
   | 'chatgpt-pro'
   | 'github-copilot'
   | 'qwen-code'
-  | 'codex'
-  | 'claude-code'
-  | 'acp-custom'
 
 /**
  * LLM Provider configuration
@@ -60,17 +57,11 @@ export interface LlmProviderConfig {
   /** AWS session token (for temporary STS credentials) */
   sessionToken?: string
 
-  // ChatGPT Pro (Codex) fields
-  reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  // Reasoning controls. `reasoningEffort` accepts any level the selected model
+  // advertises via the models.dev catalog (e.g. minimal/low/medium/high/xhigh/max),
+  // so it is stored as a free string validated against the model at selection time.
+  reasoningEffort?: string
   reasoningSummary?: 'auto' | 'concise' | 'detailed'
-
-  // ACP-backed providers (claude-code, codex, acp-custom). agent id
-  // resolves through acpx's registry; command is only set for
-  // acp-custom; workspace is the fixed-path cwd picked at provider-
-  // create time.
-  acpAgentId?: string
-  acpCommand?: string
-  acpFixedWorkspacePath?: string
 }
 
 /**

@@ -1,10 +1,14 @@
 import { useChat } from '@ai-sdk/react'
-import { DefaultChatTransport, type UIMessage } from 'ai'
+import { DefaultChatTransport, type FileUIPart, type UIMessage } from 'ai'
 import { compact } from 'es-toolkit/array'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import useDeepCompareEffect from 'use-deep-compare-effect'
 import type { Provider } from '@/components/chat/chatComponentTypes'
+import {
+  conversationForTab,
+  conversationPanelViewsStorage,
+} from '@/lib/browseros/conversationPanelStorage'
 import { isIncognitoWindow } from '@/lib/browseros/incognito'
 import {
   getWindowConversation,
@@ -20,9 +24,12 @@ import {
   MESSAGE_SENT_EVENT,
   PROVIDER_SELECTED_EVENT,
 } from '@/lib/constants/analyticsEvents'
-import { conversationStorage } from '@/lib/conversations/conversationStorage'
+import {
+  bufferActiveConversation,
+  flushActiveConversationBuffer,
+} from '@/lib/conversations/active-conversation-buffer'
 import { formatConversationHistory } from '@/lib/conversations/formatConversationHistory'
-import { useConversations } from '@/lib/conversations/useConversations'
+import { uploadConversations } from '@/lib/conversations/uploadConversationsToGraphql'
 import { declinedAppsStorage } from '@/lib/declined-apps/storage'
 import { resolveChatProvider } from '@/lib/llm-providers/provider-runtime'
 import { createDefaultBrowserOSProvider } from '@/lib/llm-providers/storage'
@@ -35,6 +42,7 @@ import { stopAgentStorage } from '@/lib/stop-agent/stop-agent-storage'
 import { selectedWorkspaceStorage } from '@/lib/workspace/workspace-storage'
 import { resolveAgentServerUrlWithRetry } from '@/modules/browseros/agent-server-url.helpers'
 import { useAgentServerUrl } from '@/modules/browseros/agent-server-url.hooks'
+import { fetchServerConversation } from '@/modules/conversations/conversations.hooks'
 import { useInvalidateCredits } from '@/modules/credits/credits.hooks'
 import { useGraphqlQuery } from '@/modules/graphql/graphql-query.hooks'
 import { useChatRefs } from './chat-refs.hooks'
@@ -48,10 +56,14 @@ import {
   prepareSidepanelSendMessagesRequest,
   toProviderOption,
 } from './chat-session-request'
+import { restoreServerConversation } from './chat-session-restore'
 import type { ChatMode } from './chat-types'
 import { addContentFilterNotice } from './content-filter-notice'
+import {
+  conversationReconnectUrl,
+  fetchConversationRunState,
+} from './conversation-run-client'
 import { useExecutionHistoryTracker } from './execution-history-tracker.hooks'
-import { useNotifyActiveTab } from './notify-active-tab.hooks'
 import { useRemoteConversationSave } from './remote-conversation-save.hooks'
 import { toLlmProviderConfig } from './sidepanel-chat-targets'
 import { stripImageToolOutputs } from './tool-output-strip'
@@ -72,6 +84,16 @@ const getLastUserMessageText = (messages: UIMessage[]) => {
     }
   }
   return ''
+}
+
+const getLastUserMessageFiles = (messages: UIMessage[]) => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role === 'user') {
+      return message.parts.filter((part) => part.type === 'file')
+    }
+  }
+  return []
 }
 
 const getResponseAndQueryFromMessageId = (
@@ -97,12 +119,9 @@ const getResponseAndQueryFromMessageId = (
 }
 
 export type ChatOrigin = 'sidepanel' | 'newtab'
-export type AgentSessionStrategy = 'conversation' | 'main'
 
 export interface ChatSessionOptions {
   origin?: ChatOrigin
-  /** ACP agent session id source. Defaults to the conversation id. */
-  agentSessionStrategy?: AgentSessionStrategy
   /** When false, messages are queued until integrations finish syncing. */
   isIntegrationsSynced?: boolean
 }
@@ -169,7 +188,6 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     enabledMcpServersRef,
     enabledCustomServersRef,
     personalizationRef,
-    setDefaultProvider,
     chatTargets,
     selectedChatTarget,
     selectChatTarget,
@@ -200,15 +218,23 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     error: agentUrlError,
   } = useAgentServerUrl()
 
-  const { saveConversation: saveLocalConversation } = useConversations()
   const {
     isLoggedIn,
+    userId,
     saveConversation: saveRemoteConversation,
     resetConversation: resetRemoteConversation,
     markMessagesAsSaved,
   } = useRemoteConversationSave()
   const [searchParams, setSearchParams] = useSearchParams()
   const conversationIdParam = searchParams.get('conversationId')
+
+  // 'local': the local server owns history (persisted during /chat, loaded from
+  // SQLite); 'cloud': the client owns it (logged-in cloud sync, or incognito).
+  // Read via a ref because the transport closure below is created only once.
+  const historyModeRef = useRef<'local' | 'cloud'>('cloud')
+  useEffect(() => {
+    historyModeRef.current = !isLoggedIn && persistHistory ? 'local' : 'cloud'
+  }, [isLoggedIn, persistHistory])
 
   const agentUrlRef = useRef(agentServerUrl)
 
@@ -333,6 +359,12 @@ export const useChatSession = (options?: ChatSessionOptions) => {
   const transportRef = useRef<DefaultChatTransport<UIMessage> | null>(null)
   if (!transportRef.current) {
     transportRef.current = new DefaultChatTransport<UIMessage>({
+      prepareReconnectToStreamRequest: async () => {
+        const serverUrl = await resolveAgentServerUrlWithRetry()
+        return {
+          api: conversationReconnectUrl(serverUrl, conversationIdRef.current),
+        }
+      },
       prepareSendMessagesRequest: async ({ messages }) => {
         const target = selectedChatTargetRef.current
         const fallbackProvider =
@@ -362,9 +394,12 @@ export const useChatSession = (options?: ChatSessionOptions) => {
         })
 
         const declinedApps = await declinedAppsStorage.getValue()
+        const historyMode = historyModeRef.current
         const previousMessages = messagesRef.current
+        // In local mode the server owns history and loads it from SQLite, so
+        // the client stops replaying it. Cloud mode still ships the projection.
         const history =
-          previousMessages.length > 0
+          historyMode === 'cloud' && previousMessages.length > 0
             ? formatConversationHistory(previousMessages)
             : undefined
         const previousConversation = history?.length ? history : undefined
@@ -373,20 +408,19 @@ export const useChatSession = (options?: ChatSessionOptions) => {
           optionsRef.current?.origin,
           personalizationRef.current,
         )
-        const agentSessionStrategy =
-          optionsRef.current?.agentSessionStrategy ?? 'conversation'
-        const agentSessionId =
-          agentSessionStrategy === 'main' ? 'main' : conversationIdRef.current
-
         const commonRequest = {
           conversationId: conversationIdRef.current,
-          agentSessionId,
           mode: currentMode,
           browserContext: requestBrowserContext,
           userSystemPrompt,
           userWorkingDir: workingDirRef.current,
           previousConversation,
+          historyMode,
           declinedApps,
+          attachments: getLastUserMessageFiles(messages).map((file) => ({
+            mediaType: file.mediaType,
+            data: file.url,
+          })),
         }
 
         const message = getLastMessageText(messages)
@@ -422,7 +456,8 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     sendMessage: baseSendMessage,
     setMessages,
     status,
-    stop,
+    stop: detachStream,
+    resumeStream,
     error: chatError,
     regenerate,
   } = useChat({
@@ -446,6 +481,134 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     },
   })
 
+  const statusRef = useRef(status)
+  useEffect(() => {
+    statusRef.current = status
+  }, [status])
+
+  const stop = useCallback(async () => {
+    // First detach this view so the UI responds immediately, then cancel the
+    // server-owned run explicitly. Aborting the fetch alone is intentionally
+    // no longer a lifecycle signal.
+    await detachStream()
+    try {
+      const serverUrl =
+        agentUrlRef.current ?? (await resolveAgentServerUrlWithRetry())
+      const response = await fetch(
+        `${serverUrl}/chat/${encodeURIComponent(conversationIdRef.current)}/stop`,
+        { method: 'POST' },
+      )
+      if (!response.ok) {
+        throw new Error(`Conversation stop failed (${response.status})`)
+      }
+    } catch (error) {
+      sentry.captureException(error, {
+        extra: {
+          conversationId: conversationIdRef.current,
+          operation: 'stop-server-conversation',
+        },
+      })
+    }
+  }, [detachStream])
+
+  const attachedPanelRunRef = useRef('')
+  // The background broker owns routing; this view only hydrates the broker's
+  // selected conversation and reconnects to its server stream. Switching tabs
+  // detaches the old subscriber without stopping either server-owned run.
+  useEffect(() => {
+    if (optionsRef.current?.origin === 'newtab') return
+
+    let cancelled = false
+    let attachEpoch = 0
+    let panelTabId: number | undefined
+    let panelWindowId: number | undefined
+    const attachForViews = async (
+      views: Awaited<ReturnType<typeof conversationPanelViewsStorage.getValue>>,
+    ) => {
+      const view = conversationForTab(views, panelTabId)
+      if (!view) return
+      const runKey = `${view.conversationId}:${view.runId}`
+      if (attachedPanelRunRef.current === runKey) return
+
+      // The panel that submitted this turn already owns the POST stream. The
+      // presence event only teaches it the server run id for future deduping.
+      if (
+        view.conversationId === conversationIdRef.current &&
+        (statusRef.current === 'submitted' || statusRef.current === 'streaming')
+      ) {
+        attachedPanelRunRef.current = runKey
+        return
+      }
+
+      attachedPanelRunRef.current = runKey
+      const epoch = ++attachEpoch
+      try {
+        const serverUrl =
+          agentUrlRef.current ?? (await resolveAgentServerUrlWithRetry())
+        const state = await fetchConversationRunState(
+          serverUrl,
+          view.conversationId,
+        )
+        if (cancelled || epoch !== attachEpoch) return
+
+        await detachStream()
+        conversationIdRef.current = view.conversationId as ReturnType<
+          typeof crypto.randomUUID
+        >
+        messagesRef.current = state.messages
+        setConversationId(
+          view.conversationId as ReturnType<typeof crypto.randomUUID>,
+        )
+        setMessages(state.messages)
+        setSearchParams({}, { replace: true })
+        if (state.status === 'running') await resumeStream()
+      } catch (error) {
+        if (cancelled || epoch !== attachEpoch) return
+        attachedPanelRunRef.current = ''
+        sentry.captureException(error, {
+          extra: {
+            conversationId: view.conversationId,
+            operation: 'attach-panel-conversation',
+          },
+        })
+      }
+    }
+
+    const refreshForActiveTab = async () => {
+      const [tab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
+      })
+      if (cancelled || tab?.id === undefined) return
+      panelTabId = tab.id
+      panelWindowId = tab.windowId
+      await attachForViews(await conversationPanelViewsStorage.getValue())
+    }
+
+    const unwatch = conversationPanelViewsStorage.watch((views) => {
+      void attachForViews(views)
+    })
+    const onActivated = (activeInfo: { tabId: number; windowId: number }) => {
+      if (
+        panelWindowId !== undefined &&
+        activeInfo.windowId !== panelWindowId
+      ) {
+        return
+      }
+      panelTabId = activeInfo.tabId
+      void conversationPanelViewsStorage.getValue().then(attachForViews)
+    }
+    chrome.tabs.onActivated.addListener(onActivated)
+    void refreshForActiveTab()
+
+    return () => {
+      cancelled = true
+      attachEpoch += 1
+      unwatch()
+      chrome.tabs.onActivated.removeListener(onActivated)
+    }
+  }, [detachStream, resumeStream, setMessages, setSearchParams])
+
   // Two cleanups once a turn is no longer streaming: drop messages with
   // empty parts (interrupted responses trip AI SDK validation on the next
   // send), and strip retained base64 image tool outputs from older turns.
@@ -460,12 +623,6 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     const cleaned = stripImageToolOutputs(nonEmpty, { keepLastMessage: true })
     if (cleaned !== messages) setMessages(cleaned)
   }, [messages, status, setMessages])
-
-  useNotifyActiveTab({
-    messages,
-    status,
-    conversationId: conversationIdRef.current,
-  })
 
   const {
     data: remoteConversationData,
@@ -504,23 +661,31 @@ export const useChatSession = (options?: ChatSessionOptions) => {
       }
       setRestoredConversationId(conversationIdParam)
       setSearchParams({}, { replace: true })
-    } else {
-      const restoreLocal = async () => {
-        const conversations = await conversationStorage.getValue()
-        const conversation = conversations?.find(
-          (c) => c.id === conversationIdParam,
-        )
+      return
+    }
 
-        if (conversation) {
-          setConversationId(
-            conversation.id as ReturnType<typeof crypto.randomUUID>,
-          )
-          setMessages(conversation.messages)
-        }
+    let cancelled = false
+    void restoreServerConversation({
+      conversationId: conversationIdParam,
+      fetchConversation: fetchServerConversation,
+      isCancelled: () => cancelled,
+      onRestore: (conversation) => {
+        setConversationId(
+          conversation.id as ReturnType<typeof crypto.randomUUID>,
+        )
+        setMessages(conversation.messages)
+      },
+      onError: (error) =>
+        sentry.captureException(error, {
+          extra: { conversationId: conversationIdParam },
+        }),
+      onSettled: () => {
         setRestoredConversationId(conversationIdParam)
         setSearchParams({}, { replace: true })
-      }
-      restoreLocal()
+      },
+    })
+    return () => {
+      cancelled = true
     }
   }, [conversationIdParam, remoteConversationData, isLoggedIn])
 
@@ -540,6 +705,10 @@ export const useChatSession = (options?: ChatSessionOptions) => {
       const windowId = tab?.windowId
       if (windowId == null || cancelled) return
       windowIdRef.current = windowId
+      // A live server presence mapping is newer than the window's last manual
+      // conversation. The broker attachment effect above will restore it.
+      const panelViews = await conversationPanelViewsStorage.getValue()
+      if (conversationForTab(panelViews, tab.id)) return
       const stored = await getWindowConversation(windowId)
       if (cancelled) return
       if (stored && stored !== conversationIdRef.current) {
@@ -599,16 +768,64 @@ export const useChatSession = (options?: ChatSessionOptions) => {
 
     // Skip all history writes in incognito so the chat never becomes durable
     // (neither local nor cloud) and can't surface in a normal window (#1189).
-    if (persistHistory) {
-      if (isLoggedIn) {
-        saveRemoteConversation(conversationIdRef.current, messagesToSave)
-      } else {
-        saveLocalConversation(conversationIdRef.current, messagesToSave)
+    // Logged-out history is owned by the local server (persisted during /chat
+    // in local mode), so only the cloud lane writes from the client now.
+    if (persistHistory && isLoggedIn) {
+      // Buffer the settled turn durably before the fire-and-forget cloud
+      // write, so an interrupted navigation still lets the next mount sync it
+      // (#559).
+      if (userId) {
+        void bufferActiveConversation({
+          id: conversationIdRef.current,
+          messages: messagesToSave,
+          lastMessagedAt: Date.now(),
+          userId,
+        })
       }
+      saveRemoteConversation(conversationIdRef.current, messagesToSave)
     }
 
     invalidateCredits()
   }, [status])
+
+  // Save the in-flight conversation before it can be lost: on page hide (full
+  // navigation, tab switch, close) and on unmount, because an in-app SPA route
+  // change to Settings unmounts the chat while the page stays visible, so
+  // visibilitychange never fires. Reads the latest messages either way; the next
+  // mount then syncs it to the cloud (#559). The settled turn is also buffered
+  // at turn end above. This effect's deps are the auth pair, not messages, so
+  // the unmount write runs once, not on every token.
+  useEffect(() => {
+    if (!persistHistory || !isLoggedIn || !userId) return
+    const writeBuffer = () => {
+      const latest = getPersistableMessages(messagesRef.current)
+      if (latest.length === 0) return
+      void bufferActiveConversation({
+        id: conversationIdRef.current,
+        messages: latest,
+        lastMessagedAt: Date.now(),
+        userId,
+      })
+    }
+    const onHide = () => {
+      if (document.visibilityState === 'hidden') writeBuffer()
+    }
+    document.addEventListener('visibilitychange', onHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onHide)
+      writeBuffer()
+    }
+  }, [persistHistory, isLoggedIn, userId])
+
+  // On mount (and on sign-in), push any buffered in-flight conversations for the
+  // current user to the cloud so an interrupted chat still lands in history. It
+  // is never restored into the active conversation; recovery is via history.
+  useEffect(() => {
+    if (!persistHistory || !isLoggedIn || !userId) return
+    void flushActiveConversationBuffer(userId, (conversations) =>
+      uploadConversations(conversations, userId),
+    )
+  }, [persistHistory, isLoggedIn, userId])
 
   useEffect(() => {
     if (chatError) invalidateCredits()
@@ -619,6 +836,7 @@ export const useChatSession = (options?: ChatSessionOptions) => {
   const pendingMessageRef = useRef<{
     text: string
     action?: ChatAction
+    files?: FileUIPart[]
   } | null>(null)
 
   const trackMessageSent = useCallback(() => {
@@ -633,7 +851,7 @@ export const useChatSession = (options?: ChatSessionOptions) => {
         selectedLlmProvider?.id,
       provider_type: agentTarget ? 'acp' : llmTargetProvider?.type,
       agent_id: agentTarget?.agentId,
-      adapter: agentTarget?.adapter,
+      adapter: agentTarget?.agentType,
       model:
         agentTarget?.modelId ??
         llmTargetProvider?.modelId ??
@@ -642,13 +860,13 @@ export const useChatSession = (options?: ChatSessionOptions) => {
   }, [mode, selectedChatTargetRef, selectedLlmProvider])
 
   const dispatchMessage = useCallback(
-    (text: string) => {
+    (text: string, files?: FileUIPart[]) => {
       trackMessageSent()
       startExecutionTask({
         conversationId: conversationIdRef.current,
         promptText: text,
       })
-      baseSendMessage({ text })
+      baseSendMessage({ text, files })
     },
     [baseSendMessage, startExecutionTask, trackMessageSent],
   )
@@ -669,11 +887,15 @@ export const useChatSession = (options?: ChatSessionOptions) => {
           return next
         })
       }
-      dispatchMessage(pending.text)
+      dispatchMessage(pending.text, pending.files)
     }
   }, [agentServerUrl, dispatchMessage, isIntegrationsSynced])
 
-  const sendMessage = (params: { text: string; action?: ChatAction }) => {
+  const sendMessage = (params: {
+    text: string
+    action?: ChatAction
+    files?: FileUIPart[]
+  }) => {
     if (!isIntegrationsSyncedRef.current || !agentUrlRef.current) {
       pendingMessageRef.current = params
       return
@@ -687,7 +909,7 @@ export const useChatSession = (options?: ChatSessionOptions) => {
         return next
       })
     }
-    dispatchMessage(params.text)
+    dispatchMessage(params.text, params.files)
   }
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: only need to run this once
@@ -713,15 +935,40 @@ export const useChatSession = (options?: ChatSessionOptions) => {
     return () => unwatch()
   }, [])
 
+  const discardServerSession = useCallback((conversationId: string) => {
+    const serverUrl = agentUrlRef.current
+    if (!serverUrl) return
+    void fetch(`${serverUrl}/chat/${encodeURIComponent(conversationId)}`, {
+      method: 'DELETE',
+      keepalive: true,
+    })
+      .then((response) => {
+        if (!response.ok && response.status !== 404) {
+          throw new Error(`Session cleanup failed (${response.status})`)
+        }
+      })
+      .catch((error) => {
+        sentry.captureException(error, {
+          extra: { conversationId },
+        })
+      })
+  }, [])
+
   const resetConversationState = () => {
+    const previousConversationId = conversationIdRef.current
     stop()
     void finishExecutionTask({ isAbort: true })
+    discardServerSession(previousConversationId)
     setConversationId(crypto.randomUUID())
     setMessages([])
     setTextToAction(new Map())
     setLiked({})
     setDisliked({})
     setRestoredConversationId(null)
+    // Clearing the restore param also cancels any in-flight logged-out restore
+    // (via the restore effect's cleanup), so a stale response can't revive the
+    // old conversation over this new blank session.
+    setSearchParams({}, { replace: true })
     resetRemoteConversation()
   }
 
@@ -739,7 +986,7 @@ export const useChatSession = (options?: ChatSessionOptions) => {
       model_id:
         target.kind === 'acp' ? target.modelId : target.provider.modelId,
       agent_id: target.kind === 'acp' ? target.agentId : undefined,
-      adapter: target.kind === 'acp' ? target.adapter : undefined,
+      adapter: target.kind === 'acp' ? target.agentType : undefined,
     })
 
     void selectChatTarget(target).catch((error) => {
@@ -751,7 +998,6 @@ export const useChatSession = (options?: ChatSessionOptions) => {
         },
       })
     })
-    if (target.kind === 'llm') setDefaultProvider(target.provider.id)
 
     if (
       previousTarget &&

@@ -1,5 +1,18 @@
+import { getModelsDevModels } from '@/lib/llm-providers/models-dev'
 import type { LlmProviderConfig } from '@/lib/llm-providers/types'
 import type { ChatMode } from '@/modules/chat/chat-types'
+
+/**
+ * Resolves whether the selected model supports reasoning from the models.dev
+ * catalog. Unknown/custom models default to true so the server still attempts
+ * reasoning (it is model-gated per provider for the cases that would error).
+ */
+function resolvesSupportsReasoning(provider: LlmProviderConfig): boolean {
+  const model = getModelsDevModels(provider.type).find(
+    (m) => m.id === provider.modelId,
+  )
+  return model?.supportsReasoning ?? true
+}
 
 export interface ChatHistoryEntry {
   role: 'user' | 'assistant'
@@ -35,6 +48,7 @@ export interface ChatRequestBodyParams {
   userWorkingDir?: string
   supportsImages?: boolean
   previousConversation?: ChatHistoryEntry[] | string
+  historyMode?: 'local' | 'cloud'
   declinedApps?: string[]
   selectedText?: string
   selectedTextSource?: {
@@ -54,11 +68,13 @@ export const buildChatRequestBody = ({
   userWorkingDir,
   supportsImages,
   previousConversation,
+  historyMode,
   declinedApps,
   selectedText,
   selectedTextSource,
   isScheduledTask,
 }: ChatRequestBodyParams) => ({
+  target: { type: 'browseros' as const, providerId: provider.id },
   message,
   provider: provider.type,
   providerId: provider.id,
@@ -78,18 +94,13 @@ export const buildChatRequestBody = ({
   sessionToken: provider.sessionToken,
   reasoningEffort: provider.reasoningEffort,
   reasoningSummary: provider.reasoningSummary,
-  // ACP-backed providers (claude-code, codex, acp-custom) need their
-  // own fields to reach the server; otherwise every provider config of
-  // a given type would share one workspace and the user-supplied
-  // workspace path would be silently dropped.
-  acpAgentId: provider.acpAgentId,
-  acpCommand: provider.acpCommand,
-  acpFixedWorkspacePath: provider.acpFixedWorkspacePath,
   browserContext,
   userSystemPrompt,
   userWorkingDir,
   supportsImages: supportsImages ?? provider.supportsImages,
+  supportsReasoning: resolvesSupportsReasoning(provider),
   previousConversation,
+  historyMode,
   declinedApps: declinedApps?.length ? declinedApps : undefined,
   selectedText,
   selectedTextSource,

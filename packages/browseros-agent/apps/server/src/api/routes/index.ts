@@ -6,22 +6,24 @@
 
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import type { TurnRegistry } from '../../lib/agents/turns/active-turn-registry'
+import { AcpAgentRuntime } from '../../lib/agents/acp/acp-agent-runtime'
 import type { OAuthTokenManager } from '../../lib/clients/oauth/token-manager'
 import { requireTrustedOrigin } from '../middleware/require-trusted-origin'
+import { ConversationRuns } from '../services/conversation-runs'
 import type { KlavisService } from '../services/klavis'
+import { BrowserMcpModule } from '../services/mcp/browser-mcp-module'
 import type { Env, HttpServerConfig } from '../types'
 import { defaultCorsConfig } from '../utils/cors'
 import { requireTrustedAppOrigin } from '../utils/request-auth'
 import { createAcpxProbeRoutes } from './acpx-probe'
 import { createAgentRoutes } from './agents'
 import { createChatRoutes } from './chat'
+import { createConversationRoutes } from './conversations'
 import { createCreditsRoutes } from './credits'
 import { createHealthRoute } from './health'
 import { createKlavisRoutes } from './klavis'
 import { createMcpRoutes } from './mcp'
 import { createMcpManagerRoutes } from './mcp-manager'
-import { createNudgeMcpRoute } from './nudge-mcp'
 import { createOAuthRoutes } from './oauth'
 import { createProviderRoutes } from './provider'
 import { createRefinePromptRoutes } from './refine-prompt'
@@ -35,7 +37,6 @@ interface CreateApiRoutesDeps {
   klavis: KlavisService
   onShutdown: () => void
   tokenManager: OAuthTokenManager | null
-  turnRegistry: TurnRegistry
 }
 
 /** Composes the BrowserOS HTTP API from the existing route factories. */
@@ -47,11 +48,33 @@ export function createApiRoutes(deps: CreateApiRoutesDeps) {
     klavis,
     onShutdown,
     tokenManager,
-    turnRegistry,
   } = deps
   const { browser, browserosId, browserSession, port, resourcesDir, version } =
     config
   const { activity } = config
+  const acpRuntime = new AcpAgentRuntime({ serverPort: port, resourcesDir })
+  const conversationRuns = new ConversationRuns({ activity })
+  // One deep module owns every browser-tool lease and execution effect;
+  // both /chat and /mcp must share it for loopback calls to recover context.
+  const browserMcp = new BrowserMcpModule({
+    version,
+    browserSession,
+    conversationRuns,
+    klavis,
+    activity,
+  })
+  const resolvedAgentRoutes =
+    agentRoutes ??
+    createAgentRoutes({
+      onDelete: (agentId) =>
+        acpRuntime.closeAllForAgent(agentId, {
+          discardPersistentState: true,
+        }),
+      onUpdate: (agentId) =>
+        acpRuntime.closeAllForAgent(agentId, {
+          discardPersistentState: true,
+        }),
+    })
 
   return (
     new Hono<Env>()
@@ -64,11 +87,7 @@ export function createApiRoutes(deps: CreateApiRoutesDeps) {
       .route('/health', createHealthRoute({ browser }))
       .route('/shutdown', createShutdownRoute({ onShutdown }))
       .route('/status', createStatusRoute({ browser, activity }))
-      .route(
-        '/test-provider',
-        createProviderRoutes({ browserosId, resourcesDir }),
-      )
-      .route('/acpx/probe', createAcpxProbeRoutes({ resourcesDir }))
+      .route('/test-provider', createProviderRoutes({ browserosId }))
       .route('/refine-prompt', createRefinePromptRoutes({ browserosId }))
       .route('/oauth', oauthRoutes(tokenManager))
       .route('/klavis', createKlavisRoutes({ klavis }))
@@ -82,54 +101,42 @@ export function createApiRoutes(deps: CreateApiRoutesDeps) {
       .route(
         '/mcp',
         createMcpRoutes({
-          version,
-          browserSession,
-          klavis,
-          activity,
+          browserMcp,
         }),
       )
-      // Dedicated in-process MCP server for the suggest_app_connection
-      // tool. Reachable only by the ACPX-spawned host agent process; not
-      // published to external agents installed via the Integrations
-      // panel (those receive the /mcp URL only).
-      .route('/mcp/nudge', createNudgeMcpRoute({ turnRegistry }))
       .route(
         '/mcp-manager',
         createMcpManagerRoutes({
           getMcpUrl: () => `http://127.0.0.1:${port}/mcp`,
+          klavis,
         }),
       )
       .route(
         '/chat',
         createChatRoutes({
           browser,
-          browserSession,
+          browserMcp,
           browserosId,
           klavis,
           aiSdkDevtoolsEnabled: config.aiSdkDevtoolsEnabled,
           serverPort: port,
           resourcesDir,
           activity,
+          acpRuntime,
+          conversationRuns,
         }),
       )
-      .route('/agents', protectedAgentRoutes(config, turnRegistry, agentRoutes))
-  )
-}
-
-function protectedAgentRoutes(
-  config: HttpServerConfig,
-  turnRegistry: TurnRegistry,
-  routes?: Hono<Env>,
-) {
-  return new Hono<Env>().use('/*', requireTrustedAppOrigin()).route(
-    '/',
-    routes ??
-      createAgentRoutes({
-        browserosServerPort: config.port,
-        resourcesDir: config.resourcesDir,
-        browser: config.browser,
-        turnRegistry,
-      }),
+      // Protected routes. The extension-origin auth middleware is applied per
+      // path prefix (Hono's `/prefix/*` also matches the bare list route), so
+      // unregistered paths stay 404 and public routes are untouched. Routes are
+      // mounted directly; the typed client derives per-route types from the
+      // factories (see rpc.ts), not from this composition.
+      .use('/acpx/probe/*', requireTrustedAppOrigin())
+      .use('/agents/*', requireTrustedAppOrigin())
+      .use('/conversations/*', requireTrustedAppOrigin())
+      .route('/acpx/probe', createAcpxProbeRoutes({ resourcesDir }))
+      .route('/agents', resolvedAgentRoutes)
+      .route('/conversations', createConversationRoutes())
   )
 }
 
